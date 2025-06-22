@@ -1,10 +1,16 @@
 # =====================================================
+# To reduce memory fragmentation and to avoid silent memory leaks
+# =====================================================
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
+# =====================================================
 # Global Configuration Flags
 # =====================================================
 TASK_TYPE = "multiclass"  # options: "multiclass" or "multilabel"
 TEACHER_IMAGE_SIZE = 224
-STUDENT_IMAGE_SIZE = 28 # Can change between 28,56,112 
-FRACTION = 0.1  # if FRACTION==1.0, forgetting tracker is skipped
+STUDENT_IMAGE_SIZE = 28
+FRACTION = 1.0  # if FRACTION==1.0, forgetting tracker is skipped
 
 # =====================================================
 # Import Libraries
@@ -41,14 +47,15 @@ from sklearn.metrics import (
     classification_report
 )
 from sklearn.preprocessing import label_binarize
+from transformers import ViTConfig, ViTForImageClassification
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 # =====================================================
 # Model Selection Flag
 # =====================================================
-model_choices = ['vgg19', 'resnet18', 'resnet34', 'resnet50', 'ViT']
-model_id = 4  # 0: vgg19, 1: resnet18, 2: resnet34, 3: resnet50, 4: ViT
+model_choices = ['vgg19', 'resnet18', 'resnet34', 'resnet50', 'ViT', 'HFViT_28', 'HFViT_56', 'HFViT_112']
+model_id = 5  # 0: vgg19, 1: resnet18, 2: resnet34, 3: resnet50, 4: ViT
 model_name = model_choices[model_id]
 print(f"Selected model: {model_name}")
 
@@ -66,6 +73,22 @@ def add_file_path_column(df, root_folder):
     df["image_id"] = df["image_id"].astype(str)
     df["file_path"] = df["image_id"].apply(lambda x: os.path.join(root_folder, f"{x}.png"))
     return df
+
+def make_vit(image_size, hidden_size, num_layers, num_heads, num_classes):
+    patch_size = image_size // 14  # ensures 14x14 patch grid
+    cfg = ViTConfig(
+        image_size=image_size,
+        patch_size=patch_size,
+        num_channels=3,
+        hidden_size=hidden_size,
+        num_hidden_layers=num_layers,
+        num_attention_heads=num_heads,
+        intermediate_size=hidden_size * 4,
+        num_labels=num_classes,
+        classifier_dropout=0.1,
+    )
+    return ViTForImageClassification(cfg)
+
 
 # =====================================================
 # Forgetting Tracker Utilities
@@ -371,8 +394,10 @@ class TS_Trainer:
             if self.task_type == "multilabel":
                 labels = labels.float()
             self.optimizer_teacher.zero_grad()
-            if model_name == 'ViT':
+            if model_name.startswith("ViT"):
                 logits, _ = self.teacher_model(images, output_attentions=False)
+            elif model_name.startswith("HFViT"):
+                logits = self.teacher_model(images).logits
             else:
                 logits = self.teacher_model(images)
             loss = self.loss_fn(logits, labels)
@@ -436,8 +461,10 @@ class TS_Trainer:
                 images, labels = images.to(self.device), labels.to(self.device)
                 if self.task_type == "multilabel":
                     labels = labels.float()
-                if model_name == 'ViT':
+                if model_name.startswith("ViT"):
                     logits, _ = self.teacher_model(images, output_attentions=False)
+                elif model_name.startswith("HFViT"):
+                    logits = self.teacher_model(images).logits
                 else:
                     logits = self.teacher_model(images)
                 loss = self.loss_fn(logits, labels)
@@ -494,8 +521,10 @@ class TS_Trainer:
                 images, labels = images.to(self.device), labels.to(self.device)
                 if self.task_type == "multilabel":
                     labels = labels.float()
-                if model_name == 'ViT':
-                    logits, _ = self.student_model(images, output_attentions=False)
+                if model_name.startswith("ViT"):
+                    logits, _ = self.teacher_model(images, output_attentions=False)
+                elif model_name.startswith("HFViT"):
+                    logits = self.teacher_model(images).logits
                 else:
                     logits = self.student_model(images)
                 loss = self.loss_fn(logits, labels)
@@ -693,10 +722,10 @@ teacher_val_dataset = Subset(teacher_dataset_full, val_idx)
 student_train_dataset = Subset(student_dataset_full, train_idx)
 student_val_dataset = Subset(student_dataset_full, val_idx)
 
-teacher_train_loader = DataLoader(teacher_train_dataset, batch_size=64, shuffle=True)
-teacher_val_loader = DataLoader(teacher_val_dataset, batch_size=64, shuffle=False)
-student_train_loader = DataLoader(student_train_dataset, batch_size=64, shuffle=True)
-student_val_loader = DataLoader(student_val_dataset, batch_size=64, shuffle=False)
+teacher_train_loader = DataLoader(teacher_train_dataset, batch_size=16, shuffle=True)
+teacher_val_loader = DataLoader(teacher_val_dataset, batch_size=16, shuffle=False)
+student_train_loader = DataLoader(student_train_dataset, batch_size=16, shuffle=True)
+student_val_loader = DataLoader(student_val_dataset, batch_size=16, shuffle=False)
 
 if multilabel_flag:
     num_classes = len(diseases)
@@ -717,7 +746,46 @@ else:
 # =====================================================
 # Model Instantiation, Optimizers, and Schedulers
 # =====================================================
+
+from transformers import ViTForImageClassification, ViTConfig
+import pandas as pd
+import math
+
+# ─────────────────────────────────────────────────────────
+# Build `labels` for HF-ViT id2label/label2id
+# ─────────────────────────────────────────────────────────
+if not multilabel_flag:
+    # Multiclass: read class_id → class_name mapping
+    mapping_df = (
+        pd.read_csv("/kaggle/input/csv-files/train.csv")
+          .loc[:, ["class_id", "class_name"]]
+          .drop_duplicates()
+          .sort_values("class_id")
+    )
+    labels = mapping_df["class_name"].tolist()
+else:
+    # Multilabel: use your diseases list
+    labels = diseases.copy()
+
+# ─────────────────────────────────────────────────────────
+# Helper to create a small ViT student via HuggingFace config
+# ─────────────────────────────────────────────────────────
+def make_vit_student(image_size, hidden_size, num_layers, num_heads, num_classes):
+    cfg = ViTConfig(
+        image_size=image_size,
+        hidden_size=hidden_size,
+        num_hidden_layers=num_layers,
+        num_attention_heads=num_heads,
+        patch_size=image_size // (int(math.sqrt(num_heads)) * 2),
+        num_labels=num_classes
+    )
+    return ViTForImageClassification(cfg)
+
+# ─────────────────────────────────────────────────────────
+# Instantiate teacher & student by model_name
+# ─────────────────────────────────────────────────────────
 if model_name == 'ViT':
+    # your custom ViT implementation
     config_teacher = {
         "patch_size": 16,
         "embed_dim": 64,
@@ -754,13 +822,34 @@ if model_name == 'ViT':
     }
     teacher_model = ViTForClassification(config_teacher).to(device)
     student_model = ViTForClassification(config_student).to(device)
+
+elif model_name in ['HFViT_28', 'HFViT_56', 'HFViT_112']:
+    hf_name = "google/vit-base-patch16-224-in21k"
+    teacher_model = ViTForImageClassification.from_pretrained(
+        hf_name,
+        num_labels=len(labels),
+        id2label={i: lab for i, lab in enumerate(labels)},
+        label2id={lab: i for i, lab in enumerate(labels)},
+        ignore_mismatched_sizes=True
+    ).to(device)
+    teacher_model.eval()
+
+    if model_name == 'HFViT_28':
+        student_model = make_vit_student(28, 192, 12, 3, len(labels)).to(device)
+    elif model_name == 'HFViT_56':
+        student_model = make_vit_student(56, 384, 12, 6, len(labels)).to(device)
+    else:  # HFViT_112
+        student_model = make_vit_student(112, 384, 12, 6, len(labels)).to(device)
+    student_model.train()
 else:
+    # CNN backbones
     teacher_model = {
         'vgg19': models.vgg19(weights=None, num_classes=num_classes),
         'resnet18': models.resnet18(weights=None, num_classes=num_classes),
         'resnet34': models.resnet34(weights=None, num_classes=num_classes),
         'resnet50': models.resnet50(weights=None, num_classes=num_classes)
     }[model_name].to(device)
+
     student_model = {
         'vgg19': models.vgg19(weights=None, num_classes=num_classes),
         'resnet18': models.resnet18(weights=None, num_classes=num_classes),
@@ -768,11 +857,15 @@ else:
         'resnet50': models.resnet50(weights=None, num_classes=num_classes)
     }[model_name].to(device)
 
+# Set training epochs
+epoch_teacher = 100
+epoch_student = 2
+loss_fn = loss_fn_weighted
 optimizer_teacher = optim.AdamW(teacher_model.parameters(), lr=5e-4)
 optimizer_student = optim.AdamW(student_model.parameters(), lr=5e-4)
-loss_fn = loss_fn_weighted
-epoch_teacher = 100
-epoch_student = 100
+scheduler_teacher = CosineAnnealingLR(optimizer_teacher, T_max=epoch_teacher)
+scheduler_student = CosineAnnealingLR(optimizer_student, T_max=epoch_student)
+
 scheduler_teacher = CosineAnnealingLR(optimizer_teacher, T_max=epoch_teacher)
 scheduler_student = CosineAnnealingLR(optimizer_student, T_max=epoch_student)
 
@@ -803,10 +896,17 @@ def update_forgetting_during_training(model, train_loader, epoch, tracker):
                 outputs, _ = model(images)
             else:
                 outputs = model(images)
+            
             if TASK_TYPE == "multiclass":
-                predicted = torch.argmax(outputs, dim=1)
+                if model_name.startswith("HFViT"):
+                     predicted = torch.argmax(outputs.logits, dim=1)
+                else:
+                     predicted = torch.argmax(outputs, dim=1)
             else:
-                predicted = (outputs > 0).float()
+                if model_name.startswith("HFViT"):
+                     predicted = (outputs.logits > 0).float()
+                else:
+                     predicted = (outputs > 0).float()
             update_forgetting_tracker(tracker, labels.cpu().numpy(), predicted.cpu().numpy(), epoch, task_type=TASK_TYPE)
 
 # =====================================================
@@ -822,10 +922,19 @@ for epoch in range(epoch_teacher):
         update_forgetting_during_training(teacher_model, teacher_train_loader, epoch, forgetting_tracker)
 
 print(f"Training {model_name} Student Model with Weighted Loss & Forgetting Updates...")
+# for epoch in range(epoch_student):
+#     trainer.train_student(config_student if model_name=='ViT' else None,
+#                           student_train_loader, student_val_loader,
+#                           1, save_model_every_n_epochs=5, display_curves=(epoch == epoch_student - 1))
 for epoch in range(epoch_student):
-    trainer.train_student(config_student if model_name=='ViT' else None,
-                          student_train_loader, student_val_loader,
-                          1, save_model_every_n_epochs=5, display_curves=(epoch == epoch_student - 1))
+    trainer.train_student(
+        config_student if (model_name == 'ViT' or model_name.startswith("HFViT")) else None,
+        student_train_loader,
+        student_val_loader,
+        1,
+        save_model_every_n_epochs=5,
+        display_curves=(epoch == epoch_student - 1)
+    )
     if FRACTION != 1.0:
         update_forgetting_during_training(student_model, student_train_loader, epoch, forgetting_tracker)
 
