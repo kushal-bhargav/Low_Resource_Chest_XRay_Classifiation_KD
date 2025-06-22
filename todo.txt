@@ -1,0 +1,10 @@
+- Include ViT Pre-trained models
+- Include Model Files and Results for 100% dataset of ViT models
+- Try forget method for ViT variants for 10,20,50% data and include result and model files
+- Extend work for More Coreset Selection Methods
+- Train on other Pre-Trained models and do the same as ViT
+- Adapt for another dataset NIH
+- Visulaization and Understanding
+- Post-training Quantization
+- Quantization Aware Training
+- Deployment of all models
